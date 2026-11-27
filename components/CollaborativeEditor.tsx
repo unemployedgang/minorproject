@@ -195,6 +195,13 @@ export default function CollaborativeEditor({
     editor.addCommand(monacoApi.KeyMod.CtrlCmd | monacoApi.KeyCode.Enter, () => {
       onRunRef.current();
     });
+    // Disarm all copy, cut, and paste commands inside Monaco editor
+    editor.addCommand(monacoApi.KeyMod.CtrlCmd | monacoApi.KeyCode.KeyC, () => {});
+    editor.addCommand(monacoApi.KeyMod.CtrlCmd | monacoApi.KeyCode.KeyV, () => {});
+    editor.addCommand(monacoApi.KeyMod.CtrlCmd | monacoApi.KeyCode.KeyX, () => {});
+    editor.addCommand(monacoApi.KeyMod.Shift | monacoApi.KeyCode.Insert, () => {});
+    editor.addCommand(monacoApi.KeyMod.CtrlCmd | monacoApi.KeyCode.Insert, () => {});
+    editor.addCommand(monacoApi.KeyMod.Shift | monacoApi.KeyCode.Delete, () => {});
     setEditorReady(true);
   }
 
@@ -281,6 +288,10 @@ export default function CollaborativeEditor({
             cursorBlinking: "smooth",
             smoothScrolling: true,
             renderWhitespace: "selection",
+            contextmenu: false,
+            copyWithSyntaxHighlighting: false,
+            emptySelectionClipboard: false,
+            dragAndDrop: false,
           }}
         />
       </div>

@@ -102,7 +102,7 @@ function getAllowedOrigins() {
   loadEnv();
   return (process.env.WEB_ORIGIN || "http://localhost:3000")
     .split(",")
-    .map((origin) => origin.trim())
+    .map((origin) => origin.trim().replace(/\/+$/, ""))
     .filter(Boolean);
 }
 
