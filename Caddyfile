@@ -1,0 +1,21 @@
+# Replace {$SITE_ADDRESS} with your domain or local IP (e.g. interview.example.com or localhost)
+{$SITE_ADDRESS:localhost} {
+	encode gzip
+
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Referrer-Policy "strict-origin-when-cross-origin"
+	}
+
+	# Route Socket.IO & Yjs WebSocket traffic to the signaling server
+	handle /socket.io/* {
+		reverse_proxy app:3001
+	}
+
+	# Route all Next.js pages and API routes
+	handle {
+		reverse_proxy app:3000
+	}
+}

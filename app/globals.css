@@ -88,6 +88,13 @@ button:disabled {
   font-size: 13px;
 }
 
+.form-header-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
 input {
   width: 100%;
   padding: 12px;

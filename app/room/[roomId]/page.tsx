@@ -1,7 +1,7 @@
 "use client";
 
 import dynamic from "next/dynamic";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useParams, useRouter } from "next/navigation";
 import { io, Socket } from "socket.io-client";
 import * as Y from "yjs";
@@ -12,6 +12,12 @@ import {
   getLanguageConfig,
   isStarterTemplate,
 } from "@/lib/languages";
+import {
+  clearStoredRoomAuth,
+  getStoredRoomAuth,
+  saveStoredRoomAuth,
+  type StoredRoomAuth,
+} from "@/lib/room-auth-storage";
 import { YjsSocketProvider } from "@/lib/yjs-socket-provider";
 import type { ExecutionResult } from "@/types/execution";
 import type {
@@ -34,6 +40,7 @@ const CollaborativeEditor = dynamic(
 
 type PeerConnection = RTCPeerConnection;
 type RoomSocket = Socket<ServerToClientEvents, ClientToServerEvents>;
+type AuthPhase = "checking" | "password_prompt" | "authorized" | "ended" | "unavailable";
 
 const ICE_SERVERS: RTCIceServer[] = [
   { urls: "stun:stun.l.google.com:19302" },
@@ -78,12 +85,31 @@ function applyTextDiff(ytext: Y.Text, nextValue: string) {
   if (insertText.length > 0) ytext.insert(start, insertText);
 }
 
+function formatRemainingTime(expiresAt: number | null): string | null {
+  if (!expiresAt) return null;
+  const diffMs = Math.max(0, expiresAt - Date.now());
+  const totalMins = Math.ceil(diffMs / 60_000);
+  if (totalMins >= 60) {
+    const hrs = Math.floor(totalMins / 60);
+    const mins = totalMins % 60;
+    return `${hrs}h ${mins}m left`;
+  }
+  return `${totalMins}m left`;
+}
+
 export default function RoomPage() {
   const params = useParams<{ roomId: string }>();
   const router = useRouter();
   const roomId = useMemo(() => decodeURIComponent(params.roomId), [params.roomId]);
 
-  const [name, setName] = useState("Guest");
+  const [authPhase, setAuthPhase] = useState<AuthPhase>("checking");
+  const [roomAuth, setRoomAuth] = useState<StoredRoomAuth | null>(null);
+  const [gateName, setGateName] = useState("");
+  const [gatePassword, setGatePassword] = useState("");
+  const [gateError, setGateError] = useState("");
+  const [gateSubmitting, setGateSubmitting] = useState(false);
+  const [endedMessage, setEndedMessage] = useState("");
+
   const [participants, setParticipants] = useState<Participant[]>([]);
   const [myId, setMyId] = useState("");
   const [remoteStreams, setRemoteStreams] = useState<Record<string, MediaStream>>({});
@@ -93,6 +119,8 @@ export default function RoomPage() {
   const [notice, setNotice] = useState("");
   const [micEnabled, setMicEnabled] = useState(true);
   const [cameraEnabled, setCameraEnabled] = useState(true);
+  const [remainingLabel, setRemainingLabel] = useState<string | null>(null);
+  const [endingSession, setEndingSession] = useState(false);
 
   const [yjsSession, setYjsSession] = useState<{
     doc: Y.Doc;
@@ -113,6 +141,8 @@ export default function RoomPage() {
   const peerStreams = useRef(new Map<string, MediaStream>());
   const pendingCandidates = useRef(new Map<string, RTCIceCandidateInit[]>());
 
+  const name = roomAuth?.name || "Guest";
+
   const teardownYjs = useCallback(() => {
     yjsProviderRef.current?.destroy();
     yjsProviderRef.current = null;
@@ -130,6 +160,88 @@ export default function RoomPage() {
     pendingCandidates.current.clear();
     setRemoteStreams({});
   }, []);
+
+  const stopMedia = useCallback(() => {
+    localStreamRef.current?.getTracks().forEach((track) => track.stop());
+    localStreamRef.current = null;
+    setLocalStream(null);
+  }, []);
+
+  // Step 1: Check stored room JWT or probe room status for inline password gate
+  useEffect(() => {
+    let cancelled = false;
+    const savedName = sessionStorage.getItem("interview-room-name")?.trim() || "";
+    if (savedName) setGateName(savedName);
+
+    async function checkAccess() {
+      if (!/^[a-zA-Z0-9-]{8,64}$/.test(roomId)) {
+        setEndedMessage("That room link is invalid.");
+        setAuthPhase("unavailable");
+        return;
+      }
+
+      const existing = getStoredRoomAuth(roomId);
+      try {
+        const res = await fetch(`/api/rooms/${encodeURIComponent(roomId)}`);
+        if (cancelled) return;
+        const info = (await res.json()) as {
+          exists: boolean;
+          status: string;
+          expiresAt?: number;
+        };
+
+        if (!res.ok || !info.exists) {
+          clearStoredRoomAuth(roomId);
+          setEndedMessage("This interview room does not exist or has been purged.");
+          setAuthPhase("unavailable");
+          return;
+        }
+        if (info.status === "ended" || info.status === "expired") {
+          clearStoredRoomAuth(roomId);
+          setEndedMessage(
+            info.status === "expired"
+              ? "This room has expired."
+              : "This interview session has ended.",
+          );
+          setAuthPhase("ended");
+          return;
+        }
+
+        if (existing) {
+          setRoomAuth(existing);
+          setAuthPhase("authorized");
+        } else {
+          setAuthPhase("password_prompt");
+        }
+      } catch {
+        if (cancelled) return;
+        if (existing) {
+          setRoomAuth(existing);
+          setAuthPhase("authorized");
+        } else {
+          setGateError("Could not verify room status. Please try again.");
+          setAuthPhase("password_prompt");
+        }
+      }
+    }
+
+    void checkAccess();
+    return () => {
+      cancelled = true;
+    };
+  }, [roomId]);
+
+  // Countdown badge for room TTL
+  useEffect(() => {
+    if (!roomAuth?.expiresAt) {
+      setRemainingLabel(null);
+      return;
+    }
+    const update = () => setRemainingLabel(formatRemainingTime(roomAuth.expiresAt));
+    update();
+    const timer = setInterval(update, 30_000);
+    return () => clearInterval(timer);
+  }, [roomAuth?.expiresAt]);
 
   const sendSignal = useCallback((targetId: string, signal: Signal) => {
     socketRef.current?.emit("room:signal", { targetId, signal });
@@ -213,19 +325,15 @@ export default function RoomPage() {
     [makePeerConnection, sendSignal],
   );
 
+  // Step 2: Connect WebRTC + Socket.IO + Yjs once authorized
   useEffect(() => {
+    if (authPhase !== "authorized" || !roomAuth) return;
+
     let disposed = false;
-    const participantName =
-      sessionStorage.getItem("interview-room-name")?.trim() || "Guest";
-    setName(participantName);
+    const activeToken = roomAuth.token;
+    const participantName = roomAuth.name;
 
     async function join() {
-      if (!/^[a-zA-Z0-9-]{8,64}$/.test(roomId)) {
-        setStatus("Unable to join");
-        setError("That room link is invalid.");
-        return;
-      }
-
       if (navigator.mediaDevices?.getUserMedia) {
         try {
           setStatus("Requesting camera and microphone…");
@@ -258,7 +366,9 @@ export default function RoomPage() {
       const signalingUrl =
         process.env.NEXT_PUBLIC_SIGNALING_URL ||
         window.location.origin.replace(/:\d+$/, ":3001");
-      const socket: RoomSocket = io(signalingUrl);
+      const socket: RoomSocket = io(signalingUrl, {
+        auth: { token: activeToken },
+      });
       socketRef.current = socket;
 
       socket.on("connect", () => {
@@ -285,7 +395,6 @@ export default function RoomPage() {
             setStatus("Connected");
             setError("");
 
-            // Initialize CRDT document & awareness sync for this room
             teardownYjs();
             const doc = new Y.Doc();
             const awareness = new Awareness(doc);
@@ -376,6 +485,23 @@ export default function RoomPage() {
         );
       });
 
+      socket.on("room:ended", ({ reason, byName }) => {
+        if (disposed) return;
+        clearStoredRoomAuth(roomId);
+        teardownYjs();
+        closePeers();
+        stopMedia();
+        socket.disconnect();
+        setEndedMessage(
+          reason === "expired"
+            ? "This room has expired."
+            : byName
+              ? `Session ended by ${byName}.`
+              : "This interview session has ended.",
+        );
+        setAuthPhase("ended");
+      });
+
       socket.on("room:signal", (message) => {
         void handleSignal(message).catch((signalError: unknown) => {
           setError(
@@ -397,7 +523,20 @@ export default function RoomPage() {
         setExecutionResult(result);
       });
 
-      socket.on("connect_error", () => {
+      socket.on("connect_error", (connErr) => {
+        const msg = connErr?.message || "";
+        if (msg.toLowerCase().includes("unauthorized")) {
+          clearStoredRoomAuth(roomId);
+          setGateError("Your session expired. Re-enter the room password.");
+          setAuthPhase("password_prompt");
+          return;
+        }
+        if (msg.toLowerCase().includes("ended") || msg.toLowerCase().includes("expired")) {
+          clearStoredRoomAuth(roomId);
+          setEndedMessage(msg);
+          setAuthPhase("ended");
+          return;
+        }
         setStatus("Connection error");
         setError(
           "Could not reach the signaling server. Make sure the app server is running.",
@@ -423,10 +562,74 @@ export default function RoomPage() {
       socketRef.current?.disconnect();
       socketRef.current = null;
       closePeers();
-      localStreamRef.current?.getTracks().forEach((track) => track.stop());
-      localStreamRef.current = null;
+      stopMedia();
     };
-  }, [closePeers, handleSignal, makePeerConnection, roomId, sendSignal, teardownYjs]);
+  }, [
+    authPhase,
+    roomAuth,
+    closePeers,
+    handleSignal,
+    makePeerConnection,
+    roomId,
+    sendSignal,
+    stopMedia,
+    teardownYjs,
+  ]);
+
+  async function handleGateSubmit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const trimmedName = gateName.trim();
+    if (!trimmedName) {
+      setGateError("Enter your name to join.");
+      return;
+    }
+    if (!gatePassword) {
+      setGateError("Enter the room password.");
+      return;
+    }
+
+    setGateSubmitting(true);
+    setGateError("");
+    try {
+      const response = await fetch("/api/rooms/join", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          roomId,
+          name: trimmedName,
+          password: gatePassword,
+        }),
+      });
+      const data = (await response.json()) as {
+        ok?: boolean;
+        token?: string;
+        participantId?: string;
+        name?: string;
+        expiresAt?: number;
+        error?: string;
+      };
+
+      if (!response.ok || !data.ok || !data.token || !data.participantId || !data.expiresAt) {
+        setGateError(data.error || "Could not join room.");
+        return;
+      }
+
+      const authPayload: StoredRoomAuth = {
+        roomId,
+        token: data.token,
+        participantId: data.participantId,
+        name: data.name || trimmedName,
+        expiresAt: data.expiresAt,
+      };
+      saveStoredRoomAuth(authPayload);
+      setRoomAuth(authPayload);
+      setAuthPhase("authorized");
+    } catch {
+      setGateError("Network error while verifying room password.");
+    } finally {
+      setGateSubmitting(false);
+    }
+  }
 
   const handleLanguageChange = useCallback((nextLanguageId: string) => {
     const doc = yjsDocRef.current;
@@ -456,7 +659,7 @@ export default function RoomPage() {
 
   const handleRunCode = useCallback(async () => {
     const doc = yjsDocRef.current;
-    if (!doc || isRunning) return;
+    if (!doc || isRunning || !roomAuth) return;
 
     const sourceCode = doc.getText("code").toString();
     const currentStdin = doc.getText("stdin").toString();
@@ -476,7 +679,10 @@ export default function RoomPage() {
     try {
       const response = await fetch("/api/execute", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${roomAuth.token}`,
+        },
         body: JSON.stringify({
           sourceCode,
           language: activeLang,
@@ -492,7 +698,8 @@ export default function RoomPage() {
               ok: false,
               language: activeLang,
               statusId: 0,
-              statusDescription: "Request Error",
+              statusDescription:
+                response.status === 429 ? "Rate Limited" : "Request Error",
               stdout: "",
               stderr: "",
               compileOutput: "",
@@ -507,7 +714,9 @@ export default function RoomPage() {
             };
 
       setExecutionResult(finalResult);
-      socketRef.current?.emit("code:result", finalResult);
+      if (typeof payload.statusId === "number") {
+        socketRef.current?.emit("code:result", finalResult);
+      }
     } catch (runError) {
       const errorResult: ExecutionResult = {
         ok: false,
@@ -530,12 +739,43 @@ export default function RoomPage() {
             : "Failed to reach code execution API.",
       };
       setExecutionResult(errorResult);
-      socketRef.current?.emit("code:result", errorResult);
     } finally {
       setIsRunning(false);
       setRunningBy(null);
     }
-  }, [isRunning, language, name]);
+  }, [isRunning, language, name, roomAuth]);
+
+  async function endSession() {
+    if (!roomAuth || endingSession) return;
+    setEndingSession(true);
+    const codeSnapshot = yjsDocRef.current?.getText("code").toString() ?? "";
+    const activeLanguage =
+      (yjsDocRef.current?.getMap<string | boolean>("roomState").get("language") as string) ||
+      language;
+
+    try {
+      await fetch(`/api/rooms/${encodeURIComponent(roomId)}/end`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${roomAuth.token}`,
+        },
+        body: JSON.stringify({ codeSnapshot, language: activeLanguage }),
+      });
+    } catch {
+      // Socket room:end also persists & closes
+    }
+
+    socketRef.current?.emit("room:end");
+    clearStoredRoomAuth(roomId);
+    teardownYjs();
+    closePeers();
+    stopMedia();
+    socketRef.current?.disconnect();
+    setEndedMessage(`Session ended by ${name}.`);
+    setAuthPhase("ended");
+    setEndingSession(false);
+  }
 
   async function copyInvite() {
     try {
@@ -573,6 +813,95 @@ export default function RoomPage() {
     setCameraEnabled(nextEnabled);
   }
 
+  if (authPhase === "checking") {
+    return (
+      <main className="landing">
+        <section className="panel">
+          <p className="eyebrow">INTERVIEW ROOM</p>
+          <h1>Verifying room…</h1>
+          <p className="muted">Checking session access for room {roomId}.</p>
+        </section>
+      </main>
+    );
+  }
+
+  if (authPhase === "unavailable" || authPhase === "ended") {
+    return (
+      <main className="landing">
+        <section className="panel">
+          <p className="eyebrow">INTERVIEW ROOM</p>
+          <h1>{authPhase === "ended" ? "Session ended" : "Room unavailable"}</h1>
+          <p className="muted">{endedMessage || "This room is no longer active."}</p>
+          <button
+            type="button"
+            className="primary-button"
+            style={{ width: "100%", marginTop: "16px" }}
+            onClick={() => router.push("/")}
+          >
+            Back to home
+          </button>
+        </section>
+      </main>
+    );
+  }
+
+  if (authPhase === "password_prompt") {
+    return (
+      <main className="landing">
+        <section className="panel landing-panel">
+          <p className="eyebrow">PRIVATE ROOM</p>
+          <h1>Enter room password</h1>
+          <p className="muted">
+            Room <span className="room-id-pill">{roomId}</span>
+          </p>
+
+          <form onSubmit={(e) => void handleGateSubmit(e)} className="room-form">
+            <label htmlFor="gate-name">Your name</label>
+            <input
+              id="gate-name"
+              autoComplete="name"
+              maxLength={60}
+              placeholder="e.g. Alex"
+              value={gateName}
+              onChange={(event) => {
+                setGateName(event.target.value);
+                setGateError("");
+              }}
+            />
+
+            <label htmlFor="gate-password">Room password</label>
+            <input
+              id="gate-password"
+              type="password"
+              autoComplete="current-password"
+              maxLength={128}
+              placeholder="Enter password shared by host"
+              value={gatePassword}
+              onChange={(event) => {
+                setGatePassword(event.target.value);
+                setGateError("");
+              }}
+            />
+
+            <button
+              type="submit"
+              className="primary-button"
+              disabled={gateSubmitting}
+            >
+              {gateSubmitting ? "Verifying…" : "Join interview"}
+            </button>
+
+            {gateError && (
+              <p className="error-message" role="alert">
+                {gateError}
+              </p>
+            )}
+          </form>
+        </section>
+      </main>
+    );
+  }
+
   return (
     <main className="workspace-page">
       <header className="workspace-header">
@@ -581,6 +910,9 @@ export default function RoomPage() {
           <div className="workspace-heading-row">
             <h1>{name}&apos;s session</h1>
             <span className="room-id-pill">Room: {roomId}</span>
+            {remainingLabel && (
+              <span className="room-id-pill">{remainingLabel}</span>
+            )}
           </div>
         </div>
 
@@ -597,10 +929,18 @@ export default function RoomPage() {
           </button>
           <button
             type="button"
-            className="danger-button compact"
+            className="secondary-button compact"
             onClick={leaveRoom}
           >
             Leave
+          </button>
+          <button
+            type="button"
+            className="danger-button compact"
+            disabled={endingSession}
+            onClick={() => void endSession()}
+          >
+            {endingSession ? "Ending…" : "End Session"}
           </button>
         </div>
       </header>

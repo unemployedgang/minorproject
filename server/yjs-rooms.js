@@ -3,6 +3,7 @@ const syncProtocol = require("y-protocols/sync");
 const awarenessProtocol = require("y-protocols/awareness");
 const encoding = require("lib0/encoding");
 const decoding = require("lib0/decoding");
+const { getRoomById, saveRoomYjsState } = require("./db");
 
 const rooms = new Map();
 
@@ -16,17 +17,72 @@ function toUint8Array(payload) {
   return null;
 }
 
+function getRoomSnapshot(room) {
+  const state = Y.encodeStateAsUpdate(room.doc);
+  const yjsStateBase64 = Buffer.from(state).toString("base64");
+  const codeSnapshot = room.doc.getText("code").toString();
+  const lang = room.doc.getMap("roomState").get("language");
+  const language = typeof lang === "string" && lang ? lang : "python";
+  return { yjsStateBase64, codeSnapshot, language };
+}
+
+function persistRoomNow(roomId) {
+  const room = rooms.get(roomId);
+  if (!room) return null;
+  if (room.persistTimer) {
+    clearTimeout(room.persistTimer);
+    room.persistTimer = null;
+  }
+  const snapshot = getRoomSnapshot(room);
+  try {
+    saveRoomYjsState(roomId, snapshot);
+  } catch (err) {
+    console.error(`Failed to persist Yjs state for room ${roomId}:`, err);
+  }
+  return snapshot;
+}
+
+function schedulePersist(roomId, room) {
+  if (room.persistTimer) return;
+  room.persistTimer = setTimeout(() => {
+    room.persistTimer = null;
+    persistRoomNow(roomId);
+  }, 1000);
+}
+
 function getOrCreateRoom(roomId, io) {
   let room = rooms.get(roomId);
   if (room) return room;
 
   const doc = new Y.Doc();
+  const dbRow = getRoomById(roomId);
+  if (dbRow?.yjs_state) {
+    try {
+      const savedBytes = Buffer.from(dbRow.yjs_state, "base64");
+      if (savedBytes.byteLength > 0) {
+        Y.applyUpdate(doc, new Uint8Array(savedBytes), "db-hydrate");
+      }
+    } catch (err) {
+      console.error(`Failed to hydrate Yjs state for room ${roomId}:`, err);
+    }
+  }
+
   const awareness = new awarenessProtocol.Awareness(doc);
   const socketClientIds = new Map();
 
   awareness.setLocalState(null);
 
+  room = {
+    doc,
+    awareness,
+    socketClientIds,
+    lastExecution: null,
+    persistTimer: null,
+  };
+
   doc.on("update", (update, origin) => {
+    if (origin === "db-hydrate") return;
+
     const encoder = encoding.createEncoder();
     syncProtocol.writeUpdate(encoder, update);
     const message = encoding.toUint8Array(encoder);
@@ -36,6 +92,8 @@ function getOrCreateRoom(roomId, io) {
     } else {
       io.to(roomId).emit("yjs:sync", message);
     }
+
+    schedulePersist(roomId, room);
   });
 
   awareness.on("update", ({ added, updated, removed }, origin) => {
@@ -60,12 +118,6 @@ function getOrCreateRoom(roomId, io) {
     }
   });
 
-  room = {
-    doc,
-    awareness,
-    socketClientIds,
-    lastExecution: null,
-  };
   rooms.set(roomId, room);
   return room;
 }
@@ -112,6 +164,16 @@ function handleAwarenessMessage(roomId, socket, payload, io) {
   awarenessProtocol.applyAwarenessUpdate(room.awareness, bytes, socket.id);
 }
 
+function destroyRoom(roomId) {
+  const room = rooms.get(roomId);
+  if (!room) return null;
+  const snapshot = persistRoomNow(roomId);
+  room.awareness.destroy();
+  room.doc.destroy();
+  rooms.delete(roomId);
+  return snapshot;
+}
+
 function removeSocketFromRoom(roomId, socketId, remainingCount) {
   const room = rooms.get(roomId);
   if (!room) return;
@@ -128,9 +190,7 @@ function removeSocketFromRoom(roomId, socketId, remainingCount) {
   }
 
   if (remainingCount === 0) {
-    room.awareness.destroy();
-    room.doc.destroy();
-    rooms.delete(roomId);
+    destroyRoom(roomId);
   }
 }
 
@@ -141,11 +201,19 @@ function setRoomLastExecution(roomId, result) {
   }
 }
 
+function persistAllActiveRooms() {
+  for (const roomId of rooms.keys()) {
+    persistRoomNow(roomId);
+  }
+}
+
 module.exports = {
   getOrCreateRoom,
   syncSocketOnJoin,
   handleSyncMessage,
   handleAwarenessMessage,
   removeSocketFromRoom,
+  destroyRoom,
   setRoomLastExecution,
+  persistAllActiveRooms,
 };

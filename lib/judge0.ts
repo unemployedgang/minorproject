@@ -3,6 +3,8 @@ import https from "node:https";
 import { getLanguageConfig } from "@/lib/languages";
 import type { ExecutionResult } from "@/types/execution";
 
+const MAX_OUTPUT_CHARS = 65_536;
+
 interface Judge0SubmissionResponse {
   token?: string;
   stdout?: string | null;
@@ -39,11 +41,17 @@ function stripAnsi(text: string): string {
   );
 }
 
+function truncateOutput(text: string): string {
+  if (text.length <= MAX_OUTPUT_CHARS) return text;
+  return `${text.slice(0, MAX_OUTPUT_CHARS)}\n... [output truncated at 64 KB]`;
+}
+
 function sanitizeSandboxOutput(raw: string): string {
   if (!raw) return "";
-  return stripAnsi(raw)
+  const cleaned = stripAnsi(raw)
     .replace(/\/(?:tmp|judge|box|isolate)[^:\s]*\//g, "")
     .trimEnd();
+  return truncateOutput(cleaned);
 }
 
 function requestJudge0Json(
@@ -133,24 +141,36 @@ export async function executeWithJudge0(params: {
   const config = getLanguageConfig(params.language);
   const baseUrl = getJudge0BaseUrl();
   const headers = buildHeaders();
+  const submitUrl = `${baseUrl}/submissions?base64_encoded=true&wait=true`;
 
-  const payload = JSON.stringify({
+  const basePayload = {
     source_code: Buffer.from(params.sourceCode, "utf-8").toString("base64"),
     language_id: config.judge0Id,
     stdin: Buffer.from(params.stdin ?? "", "utf-8").toString("base64"),
     cpu_time_limit: 5,
     wall_time_limit: 10,
     memory_limit: 128000,
+  };
+
+  const hardenedPayload = JSON.stringify({
+    ...basePayload,
+    enable_network: false,
+    max_processes_and_or_threads: 30,
+    max_file_size: 1024,
   });
 
   let response: { statusCode: number; text: string };
   try {
-    response = await requestJudge0Json(
-      `${baseUrl}/submissions?base64_encoded=true&wait=true`,
-      "POST",
-      headers,
-      payload,
-    );
+    response = await requestJudge0Json(submitUrl, "POST", headers, hardenedPayload);
+    // Some Judge0 instances forbid per-submission limit overrides with 422; fallback to base caps
+    if (response.statusCode === 422) {
+      response = await requestJudge0Json(
+        submitUrl,
+        "POST",
+        headers,
+        JSON.stringify(basePayload),
+      );
+    }
   } catch (err) {
     return buildErrorResult(
       config.id,
@@ -216,7 +236,7 @@ export async function executeWithJudge0(params: {
     return buildErrorResult(config.id, "Timed out waiting for Judge0 execution.");
   }
 
-  const stdout = decodeBase64(data.stdout);
+  const stdout = truncateOutput(decodeBase64(data.stdout));
   const stderr = sanitizeSandboxOutput(decodeBase64(data.stderr));
   const compileOutput = sanitizeSandboxOutput(decodeBase64(data.compile_output));
   const message = sanitizeSandboxOutput(decodeBase64(data.message));

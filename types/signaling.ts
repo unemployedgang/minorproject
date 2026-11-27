@@ -15,15 +15,17 @@ export type JoinResponse =
       participantId: string;
       participants: Participant[];
       lastExecution: ExecutionResult | null;
+      expiresAt: number;
     }
   | { ok: false; error: string };
 
 export interface ClientToServerEvents {
   "room:join": (
-    request: { roomId: string; name: string },
+    request: { roomId: string; name?: string },
     acknowledge: (response: JoinResponse) => void,
   ) => void;
   "room:signal": (request: { targetId: string; signal: Signal }) => void;
+  "room:end": () => void;
   "yjs:ready": () => void;
   "yjs:sync": (payload: ArrayBuffer | Uint8Array) => void;
   "yjs:awareness": (payload: ArrayBuffer | Uint8Array) => void;
@@ -34,6 +36,7 @@ export interface ClientToServerEvents {
 export interface ServerToClientEvents {
   "room:peer-joined": (participant: Participant) => void;
   "room:peer-left": (participant: { id: string }) => void;
+  "room:ended": (payload: { reason: "ended" | "expired"; endedAt: number; byName?: string }) => void;
   "room:signal": (message: {
     fromId: string;
     fromName: string;
