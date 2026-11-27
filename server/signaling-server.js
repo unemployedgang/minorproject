@@ -1,5 +1,13 @@
 const { createServer } = require("node:http");
 const { Server } = require("socket.io");
+const {
+  getOrCreateRoom,
+  syncSocketOnJoin,
+  handleSyncMessage,
+  handleAwarenessMessage,
+  removeSocketFromRoom,
+  setRoomLastExecution,
+} = require("./yjs-rooms");
 
 const port = Number(process.env.SIGNALING_PORT || 3001);
 const allowedOrigins = (process.env.WEB_ORIGIN || "http://localhost:3000")
@@ -11,6 +19,7 @@ const io = new Server(httpServer, {
     origin: allowedOrigins,
     methods: ["GET", "POST"],
   },
+  maxHttpBufferSize: 2 * 1024 * 1024,
 });
 
 const roomParticipants = new Map();
@@ -44,10 +53,13 @@ io.on("connection", (socket) => {
     socket.data.name = participantName;
     socket.join(roomId);
 
+    const yjsRoom = getOrCreateRoom(roomId, io);
+
     acknowledge({
       ok: true,
       participantId: socket.id,
       participants: existingParticipants,
+      lastExecution: yjsRoom.lastExecution,
     });
     socket.to(roomId).emit("room:peer-joined", {
       id: socket.id,
@@ -73,18 +85,58 @@ io.on("connection", (socket) => {
     });
   });
 
+  socket.on("yjs:ready", () => {
+    const roomId = socket.data.roomId;
+    if (!roomId) return;
+    syncSocketOnJoin(roomId, socket, io);
+  });
+
+  socket.on("yjs:sync", (payload) => {
+    const roomId = socket.data.roomId;
+    if (!roomId) return;
+    handleSyncMessage(roomId, socket, payload, io);
+  });
+
+  socket.on("yjs:awareness", (payload) => {
+    const roomId = socket.data.roomId;
+    if (!roomId) return;
+    handleAwarenessMessage(roomId, socket, payload, io);
+  });
+
+  socket.on("code:running", ({ language } = {}) => {
+    const roomId = socket.data.roomId;
+    if (!roomId || typeof language !== "string") return;
+    socket.to(roomId).emit("code:running", {
+      byName: socket.data.name || "Peer",
+      language,
+    });
+  });
+
+  socket.on("code:result", (result) => {
+    const roomId = socket.data.roomId;
+    if (!roomId || !result || typeof result !== "object") return;
+    const enriched = {
+      ...result,
+      ranBy: result.ranBy || socket.data.name || "Peer",
+    };
+    setRoomLastExecution(roomId, enriched);
+    socket.to(roomId).emit("code:result", enriched);
+  });
+
   socket.on("disconnect", () => {
     const roomId = socket.data.roomId;
     if (!roomId) return;
 
     const participants = roomParticipants.get(roomId);
     participants?.delete(socket.id);
-    if (participants?.size === 0) roomParticipants.delete(roomId);
+    const remainingCount = participants?.size ?? 0;
+    if (remainingCount === 0) roomParticipants.delete(roomId);
 
+    removeSocketFromRoom(roomId, socket.id, remainingCount);
     socket.to(roomId).emit("room:peer-left", { id: socket.id });
   });
 });
 
 httpServer.listen(port, () => {
-  console.log(`Signaling server listening on port ${port}`);
+  console.log(`Signaling & Yjs server listening on port ${port}`);
 });
