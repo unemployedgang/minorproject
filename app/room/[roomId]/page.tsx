@@ -42,6 +42,8 @@ type PeerConnection = RTCPeerConnection;
 type RoomSocket = Socket<ServerToClientEvents, ClientToServerEvents>;
 type AuthPhase = "checking" | "password_prompt" | "authorized" | "ended" | "unavailable";
 
+const MIC_VOLUME_THRESHOLD = 40;
+
 const ICE_SERVERS: RTCIceServer[] = [
   { urls: "stun:stun.l.google.com:19302" },
   ...(process.env.NEXT_PUBLIC_TURN_URL
@@ -117,10 +119,17 @@ export default function RoomPage() {
   const [status, setStatus] = useState("Connecting…");
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
-  const [micEnabled, setMicEnabled] = useState(true);
-  const [cameraEnabled, setCameraEnabled] = useState(true);
   const [remainingLabel, setRemainingLabel] = useState<string | null>(null);
   const [endingSession, setEndingSession] = useState(false);
+  const [isFullscreenActive, setIsFullscreenActive] = useState(false);
+  const [showFullscreenOverlay, setShowFullscreenOverlay] = useState(false);
+  const [enablingMedia, setEnablingMedia] = useState(false);
+  const [currentVolume, setCurrentVolume] = useState(0);
+  const [peakVolume, setPeakVolume] = useState(0);
+  const [micCheckPassed, setMicCheckPassed] = useState(false);
+  const [sessionIdCopied, setSessionIdCopied] = useState(false);
+  const isFullscreenActiveRef = useRef(false);
+  isFullscreenActiveRef.current = isFullscreenActive;
 
   const [yjsSession, setYjsSession] = useState<{
     doc: Y.Doc;
@@ -140,6 +149,8 @@ export default function RoomPage() {
   const peerConnections = useRef(new Map<string, PeerConnection>());
   const peerStreams = useRef(new Map<string, MediaStream>());
   const pendingCandidates = useRef(new Map<string, RTCIceCandidateInit[]>());
+  const hasTerminatedRef = useRef(false);
+  const nativeWriteTextRef = useRef<((text: string) => Promise<void>) | null>(null);
 
   const name = roomAuth?.name || "Guest";
 
@@ -325,40 +336,53 @@ export default function RoomPage() {
     [makePeerConnection, sendSignal],
   );
 
-  // Step 2: Connect WebRTC + Socket.IO + Yjs once authorized
+  // Step 2: Connect WebRTC + Socket.IO + Yjs once authorized and in strict fullscreen
   useEffect(() => {
-    if (authPhase !== "authorized" || !roomAuth) return;
+    if (authPhase !== "authorized" || !roomAuth || !isFullscreenActive) return;
 
     let disposed = false;
     const activeToken = roomAuth.token;
     const participantName = roomAuth.name;
 
     async function join() {
-      if (navigator.mediaDevices?.getUserMedia) {
-        try {
-          setStatus("Requesting camera and microphone…");
-          const stream = await navigator.mediaDevices.getUserMedia({
-            audio: true,
-            video: true,
-          });
-          if (disposed) {
-            stream.getTracks().forEach((track) => track.stop());
-            return;
+      let stream = localStreamRef.current;
+      if (!stream || stream.getTracks().length === 0 || !stream.active) {
+        if (navigator.mediaDevices?.getUserMedia) {
+          try {
+            setStatus("Connecting camera and microphone…");
+            stream = await navigator.mediaDevices.getUserMedia({
+              audio: true,
+              video: true,
+            });
+            if (disposed) {
+              stream.getTracks().forEach((track) => track.stop());
+              return;
+            }
+            localStreamRef.current = stream;
+            setLocalStream(stream);
+          } catch (mediaError) {
+            if (disposed) return;
+            setNotice(
+              mediaError instanceof Error
+                ? `Camera/mic unavailable (${mediaError.message}). Joined in editor-only mode.`
+                : "Camera/mic unavailable. Joined in editor-only mode.",
+            );
           }
-          localStreamRef.current = stream;
-          setLocalStream(stream);
-        } catch (mediaError) {
-          if (disposed) return;
+        } else {
           setNotice(
-            mediaError instanceof Error
-              ? `Camera/mic unavailable (${mediaError.message}). Joined in editor-only mode.`
-              : "Camera/mic unavailable. Joined in editor-only mode.",
+            "Camera and microphone require HTTPS or localhost. Joined in editor-only mode.",
           );
         }
-      } else {
-        setNotice(
-          "Camera and microphone require HTTPS or localhost. Joined in editor-only mode.",
-        );
+      }
+
+      if (stream) {
+        // Enforce that camera and mic tracks remain on continuously
+        stream.getTracks().forEach((track) => {
+          track.enabled = true;
+          track.onended = () => {
+            setNotice(`Warning: ${track.kind} hardware was disconnected.`);
+          };
+        });
       }
 
       if (disposed) return;
@@ -567,6 +591,7 @@ export default function RoomPage() {
   }, [
     authPhase,
     roomAuth,
+    isFullscreenActive,
     closePeers,
     handleSignal,
     makePeerConnection,
@@ -575,6 +600,337 @@ export default function RoomPage() {
     stopMedia,
     teardownYjs,
   ]);
+
+  // Continuous lock: ensure camera and mic tracks are strictly enabled
+  useEffect(() => {
+    if (!localStream) return;
+    const interval = setInterval(() => {
+      localStream.getTracks().forEach((track) => {
+        if (!track.enabled) track.enabled = true;
+      });
+    }, 1000);
+    return () => clearInterval(interval);
+  }, [localStream]);
+
+  // Handler to close session automatically when exiting fullscreen
+  const terminateSessionDueToFullscreenExit = useCallback(async () => {
+    if (hasTerminatedRef.current) return;
+    hasTerminatedRef.current = true;
+
+    const codeSnapshot = yjsDocRef.current?.getText("code").toString() ?? "";
+    const activeLanguage =
+      (yjsDocRef.current?.getMap<string | boolean>("roomState").get("language") as string) ||
+      language;
+
+    try {
+      if (roomAuth?.token) {
+        await fetch(`/api/rooms/${encodeURIComponent(roomId)}/end`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${roomAuth.token}`,
+          },
+          body: JSON.stringify({ codeSnapshot, language: activeLanguage }),
+        });
+      }
+    } catch {
+      // Ignore network errors on emergency exit
+    }
+
+    socketRef.current?.emit("room:end");
+    clearStoredRoomAuth(roomId);
+    teardownYjs();
+    closePeers();
+    stopMedia();
+    socketRef.current?.disconnect();
+
+    setIsFullscreenActive(false);
+    setEndedMessage(
+      "Session automatically closed: You exited fullscreen mode. Strict fullscreen is required throughout the interview.",
+    );
+    setAuthPhase("ended");
+  }, [closePeers, language, roomId, roomAuth, stopMedia, teardownYjs]);
+
+  // Fullscreen change listener: prompts re-entry in testing mode instead of terminating session
+  useEffect(() => {
+    if (authPhase !== "authorized" || !isFullscreenActive) return;
+
+    const handleFullscreenChange = () => {
+      const isFullscreenNow = Boolean(
+        document.fullscreenElement ||
+          (document as unknown as { webkitFullscreenElement?: Element })
+            .webkitFullscreenElement,
+      );
+
+      if (!isFullscreenNow && isFullscreenActiveRef.current && !hasTerminatedRef.current) {
+        // Testing mode: Prompt user to enter fullscreen again instead of ending the session
+        setShowFullscreenOverlay(true);
+      } else if (isFullscreenNow) {
+        setShowFullscreenOverlay(false);
+      }
+    };
+
+    document.addEventListener("fullscreenchange", handleFullscreenChange);
+    document.addEventListener("webkitfullscreenchange", handleFullscreenChange);
+
+    return () => {
+      document.removeEventListener("fullscreenchange", handleFullscreenChange);
+      document.removeEventListener("webkitfullscreenchange", handleFullscreenChange);
+    };
+  }, [authPhase, isFullscreenActive]);
+
+  async function reenterFullscreen() {
+    try {
+      const docEl = document.documentElement as HTMLElement & {
+        webkitRequestFullscreen?: () => Promise<void>;
+      };
+      if (docEl.requestFullscreen) {
+        await docEl.requestFullscreen();
+      } else if (docEl.webkitRequestFullscreen) {
+        await docEl.webkitRequestFullscreen();
+      }
+      setShowFullscreenOverlay(false);
+    } catch (err) {
+      console.warn("Fullscreen re-entry failed:", err);
+    }
+  }
+
+  // Microphone volume threshold check for pre-session verification
+  useEffect(() => {
+    if (authPhase !== "authorized" || isFullscreenActive || !localStream) {
+      return;
+    }
+
+    const audioTracks = localStream.getAudioTracks();
+    if (audioTracks.length === 0) return;
+
+    const AudioContextClass =
+      window.AudioContext ||
+      (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
+    if (!AudioContextClass) return;
+
+    let audioContext: AudioContext;
+    try {
+      audioContext = new AudioContextClass();
+      if (audioContext.state === "suspended") {
+        void audioContext.resume();
+      }
+    } catch {
+      return;
+    }
+
+    const source = audioContext.createMediaStreamSource(localStream);
+    const analyser = audioContext.createAnalyser();
+    analyser.fftSize = 256;
+    analyser.smoothingTimeConstant = 0.2;
+    source.connect(analyser);
+
+    const dataArray = new Uint8Array(analyser.frequencyBinCount);
+    let animationFrameId: number;
+    let localPeak = 0;
+    let lastUiUpdate = 0;
+    let lastDisplayedVol = -1;
+
+    const checkVolume = () => {
+      analyser.getByteTimeDomainData(dataArray);
+      let maxDev = 0;
+      for (let i = 0; i < dataArray.length; i++) {
+        const dev = Math.abs(dataArray[i] - 128);
+        if (dev > maxDev) maxDev = dev;
+      }
+
+      // Convert max deviation (0-128) to 0-100% volume
+      const vol = Math.min(100, Math.round((maxDev / 128) * 160));
+
+      const now = performance.now();
+      if (vol !== lastDisplayedVol && now - lastUiUpdate >= 65) {
+        lastDisplayedVol = vol;
+        lastUiUpdate = now;
+        setCurrentVolume(vol);
+      }
+
+      if (vol > localPeak) {
+        localPeak = vol;
+        setPeakVolume(localPeak);
+      }
+
+      if (vol > MIC_VOLUME_THRESHOLD || localPeak > MIC_VOLUME_THRESHOLD) {
+        setMicCheckPassed(true);
+      }
+
+      animationFrameId = requestAnimationFrame(checkVolume);
+    };
+
+    animationFrameId = requestAnimationFrame(checkVolume);
+
+    return () => {
+      cancelAnimationFrame(animationFrameId);
+      try {
+        audioContext.close();
+      } catch {}
+    };
+  }, [authPhase, isFullscreenActive, localStream]);
+
+  // Strictly disallow clipboard actions, copy/pasting, and opening clipboard
+  useEffect(() => {
+    if (authPhase !== "authorized" || !isFullscreenActive) return;
+
+    // Neutralize navigator.clipboard so opening or writing to clipboard is rejected
+    try {
+      const existingClipboard = navigator.clipboard as
+        | (Clipboard & { __locked?: boolean })
+        | undefined;
+      if (
+        existingClipboard &&
+        !existingClipboard.__locked &&
+        typeof existingClipboard.writeText === "function"
+      ) {
+        nativeWriteTextRef.current = existingClipboard.writeText.bind(existingClipboard);
+      }
+
+      const rejectClipboard = () =>
+        Promise.reject(
+          new DOMException(
+            "Clipboard access is strictly prohibited in this session.",
+            "NotAllowedError",
+          ),
+        );
+      Object.defineProperty(navigator, "clipboard", {
+        value: {
+          __locked: true,
+          read: rejectClipboard,
+          readText: rejectClipboard,
+          write: rejectClipboard,
+          writeText: rejectClipboard,
+        },
+        configurable: true,
+        writable: false,
+      });
+    } catch {
+      // Browser may seal navigator.clipboard in some contexts
+    }
+
+    const handleBlockedClipboard = (event: Event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      setNotice("Clipboard actions (copy, cut, paste) are strictly prohibited.");
+    };
+
+    const handleContextMenu = (event: MouseEvent) => {
+      event.preventDefault();
+      event.stopPropagation();
+    };
+
+    const handleKeyDown = (event: KeyboardEvent) => {
+      const isCtrlOrMeta = event.ctrlKey || event.metaKey;
+      const key = event.key.toLowerCase();
+
+      // Intercept Ctrl/Cmd + C, V, X, Insert, Win+V, Shift+Insert, Shift+Delete
+      if (
+        (isCtrlOrMeta && (key === "c" || key === "v" || key === "x" || key === "insert")) ||
+        (event.shiftKey && (key === "insert" || key === "delete"))
+      ) {
+        event.preventDefault();
+        event.stopPropagation();
+        setNotice("Copying and pasting are strictly disabled.");
+      }
+    };
+
+    window.addEventListener("copy", handleBlockedClipboard, true);
+    window.addEventListener("cut", handleBlockedClipboard, true);
+    window.addEventListener("paste", handleBlockedClipboard, true);
+    window.addEventListener("beforecopy", handleBlockedClipboard, true);
+    window.addEventListener("beforecut", handleBlockedClipboard, true);
+    window.addEventListener("beforepaste", handleBlockedClipboard, true);
+    window.addEventListener("contextmenu", handleContextMenu, true);
+    window.addEventListener("keydown", handleKeyDown, true);
+
+    return () => {
+      window.removeEventListener("copy", handleBlockedClipboard, true);
+      window.removeEventListener("cut", handleBlockedClipboard, true);
+      window.removeEventListener("paste", handleBlockedClipboard, true);
+      window.removeEventListener("beforecopy", handleBlockedClipboard, true);
+      window.removeEventListener("beforecut", handleBlockedClipboard, true);
+      window.removeEventListener("beforepaste", handleBlockedClipboard, true);
+      window.removeEventListener("contextmenu", handleContextMenu, true);
+      window.removeEventListener("keydown", handleKeyDown, true);
+    };
+  }, [authPhase, isFullscreenActive]);
+
+  async function startSessionWithMediaAndFullscreen() {
+    if (enablingMedia) return;
+    setEnablingMedia(true);
+    setGateError("");
+
+    let stream = localStreamRef.current;
+    if (!stream || stream.getTracks().length === 0 || !stream.active) {
+      if (!navigator.mediaDevices?.getUserMedia) {
+        setGateError("Your browser does not support camera and microphone access.");
+        setEnablingMedia(false);
+        return;
+      }
+
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({
+          audio: true,
+          video: true,
+        });
+        stream.getTracks().forEach((track) => {
+          track.enabled = true;
+          track.onended = () => {
+            setNotice(`Warning: ${track.kind} hardware was disconnected.`);
+          };
+        });
+        localStreamRef.current = stream;
+        setLocalStream(stream);
+        setEnablingMedia(false);
+        // After enabling devices, allow user to test mic above 40% volume
+        return;
+      } catch (mediaErr) {
+        setEnablingMedia(false);
+        const isDenied =
+          mediaErr instanceof Error &&
+          (mediaErr.name === "NotAllowedError" || mediaErr.name === "PermissionDeniedError");
+        setGateError(
+          isDenied
+            ? "Camera and microphone permissions were denied. You must grant camera and mic permissions in your browser before entering the session."
+            : mediaErr instanceof Error
+            ? `Camera/mic error: ${mediaErr.message}`
+            : "Camera and microphone access is required to proceed.",
+        );
+        return;
+      }
+    }
+
+    // Require mic volume verification (> 40% volume)
+    if (!micCheckPassed) {
+      setGateError(
+        `Microphone check required: Speak into your microphone so volume goes above ${MIC_VOLUME_THRESHOLD}% to unlock the session.`,
+      );
+      setEnablingMedia(false);
+      return;
+    }
+
+    // Now that camera and mic are permitted and voice check passed, enter fullscreen
+    try {
+      const docEl = document.documentElement as HTMLElement & {
+        webkitRequestFullscreen?: () => Promise<void>;
+      };
+      if (docEl.requestFullscreen) {
+        await docEl.requestFullscreen();
+      } else if (docEl.webkitRequestFullscreen) {
+        await docEl.webkitRequestFullscreen();
+      }
+      hasTerminatedRef.current = false;
+      setIsFullscreenActive(true);
+    } catch {
+      setGateError(
+        "Fullscreen access was blocked or denied. Strict fullscreen mode is mandatory to enter the interview.",
+      );
+    } finally {
+      setEnablingMedia(false);
+    }
+  }
 
   async function handleGateSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -747,6 +1103,7 @@ export default function RoomPage() {
 
   async function endSession() {
     if (!roomAuth || endingSession) return;
+    hasTerminatedRef.current = true;
     setEndingSession(true);
     const codeSnapshot = yjsDocRef.current?.getText("code").toString() ?? "";
     const activeLanguage =
@@ -772,45 +1129,59 @@ export default function RoomPage() {
     closePeers();
     stopMedia();
     socketRef.current?.disconnect();
+
+    if (document.fullscreenElement) {
+      document.exitFullscreen().catch(() => {});
+    }
+
     setEndedMessage(`Session ended by ${name}.`);
     setAuthPhase("ended");
     setEndingSession(false);
   }
 
-  async function copyInvite() {
+  // Temporary testing helper to copy session/room ID despite clipboard lock
+  async function copySessionId() {
     try {
-      await navigator.clipboard.writeText(window.location.href);
-      setNotice("Invite link copied to clipboard.");
+      const currentClipboard = navigator.clipboard as
+        | (Clipboard & { __locked?: boolean })
+        | undefined;
+      const writeFn =
+        nativeWriteTextRef.current ||
+        (currentClipboard &&
+        !currentClipboard.__locked &&
+        typeof currentClipboard.writeText === "function"
+          ? currentClipboard.writeText.bind(currentClipboard)
+          : null);
+
+      if (!writeFn) {
+        setError(`Could not access clipboard. Session ID: ${roomId}`);
+        return;
+      }
+
+      await writeFn(roomId);
+      setSessionIdCopied(true);
+      setNotice(`Session ID copied: ${roomId}`);
       setTimeout(() => {
+        setSessionIdCopied(false);
         setNotice((current) =>
-          current === "Invite link copied to clipboard." ? "" : current,
+          current === `Session ID copied: ${roomId}` ? "" : current,
         );
-      }, 3000);
+      }, 2500);
     } catch {
-      setError("Could not copy the invite link. Copy it from your browser address bar.");
+      setError(`Could not copy automatically. Session ID: ${roomId}`);
     }
   }
 
   function leaveRoom() {
+    hasTerminatedRef.current = true;
     teardownYjs();
+    closePeers();
+    stopMedia();
     socketRef.current?.disconnect();
+    if (document.fullscreenElement) {
+      document.exitFullscreen().catch(() => {});
+    }
     router.push("/");
-  }
-
-  function toggleAudio() {
-    const nextEnabled = !micEnabled;
-    localStream?.getAudioTracks().forEach((track) => {
-      track.enabled = nextEnabled;
-    });
-    setMicEnabled(nextEnabled);
-  }
-
-  function toggleCamera() {
-    const nextEnabled = !cameraEnabled;
-    localStream?.getVideoTracks().forEach((track) => {
-      track.enabled = nextEnabled;
-    });
-    setCameraEnabled(nextEnabled);
   }
 
   if (authPhase === "checking") {
@@ -902,6 +1273,149 @@ export default function RoomPage() {
     );
   }
 
+  if (authPhase === "authorized" && !isFullscreenActive) {
+    return (
+      <main className="landing">
+        <section className="panel landing-panel fullscreen-gate">
+          <p className="eyebrow">SESSION SETUP & INTEGRITY</p>
+          <h1>Camera, Mic & Voice Check</h1>
+          <p className="muted">
+            Welcome, <strong>{name}</strong>. Before beginning the session, enable your devices and verify your microphone volume.
+          </p>
+
+          <div
+            style={{
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "space-between",
+              gap: "8px",
+              marginTop: "12px",
+            }}
+          >
+            <span className="room-id-pill">Session ID: {roomId}</span>
+            <button
+              type="button"
+              className="secondary-button compact"
+              onClick={() => void copySessionId()}
+            >
+              {sessionIdCopied ? "Copied!" : "Copy Session ID"}
+            </button>
+          </div>
+
+          {localStream && (
+            <div style={{ margin: "16px 0", textAlign: "center" }}>
+              <div
+                style={{
+                  width: "100%",
+                  height: "160px",
+                  borderRadius: "8px",
+                  overflow: "hidden",
+                  background: "#000",
+                  border: "1px solid #303136",
+                }}
+              >
+                <PreviewVideo stream={localStream} />
+              </div>
+
+              {/* Mic Volume Threshold Check */}
+              <div className="mic-check-box">
+                <div className="mic-check-header">
+                  <span>🎙️ Mic Check (&gt; {MIC_VOLUME_THRESHOLD}% Volume)</span>
+                  <span
+                    style={{
+                      color: currentVolume > MIC_VOLUME_THRESHOLD ? "#22c55e" : "#a4a6ad",
+                      fontWeight: 700,
+                    }}
+                  >
+                    {currentVolume}%
+                  </span>
+                </div>
+
+                <div className="volume-meter-wrapper">
+                  <div
+                    className={`volume-meter-fill ${currentVolume > MIC_VOLUME_THRESHOLD || peakVolume > MIC_VOLUME_THRESHOLD ? "threshold-reached" : ""}`}
+                    style={{ width: `${Math.min(100, currentVolume)}%` }}
+                  />
+                  <div
+                    className="volume-threshold-line"
+                    title={`Above ${MIC_VOLUME_THRESHOLD}% Threshold`}
+                  />
+                  <span className="volume-threshold-label">{MIC_VOLUME_THRESHOLD}% Target</span>
+                </div>
+
+                <div className="mic-check-status-row">
+                  <span>Current: {currentVolume}%</span>
+                  <span>Peak: {peakVolume}%</span>
+                </div>
+
+                <div className="mic-check-items">
+                  <div className={`mic-check-item ${micCheckPassed ? "done" : ""}`}>
+                    <span>{micCheckPassed ? "✅" : "⭕"}</span>
+                    <span>
+                      {micCheckPassed
+                        ? `Mic volume verified (Peak: ${peakVolume}% > ${MIC_VOLUME_THRESHOLD}%)`
+                        : `Speak into your mic above ${MIC_VOLUME_THRESHOLD}% volume (Peak: ${peakVolume}%)`}
+                    </span>
+                  </div>
+                </div>
+
+                {micCheckPassed && (
+                  <p
+                    style={{
+                      color: "#86efac",
+                      fontSize: "12px",
+                      marginTop: "10px",
+                      fontWeight: 600,
+                    }}
+                  >
+                    🎉 Microphone verified! You may now enter fullscreen and begin.
+                  </p>
+                )}
+              </div>
+            </div>
+          )}
+
+          <div className="fullscreen-warning-box">
+            <p><strong>Testing Mode Rules:</strong></p>
+            <ul>
+              <li>
+                <strong>Camera & Mic Locked:</strong> Your camera and microphone will remain active continuously. There is no option to mute or disable them.
+              </li>
+              <li>
+                <strong>Testing Fullscreen:</strong> Exiting fullscreen will prompt you to re-enter fullscreen instead of ending the session.
+              </li>
+              <li>
+                <strong>No Clipboard:</strong> Copying, cutting, pasting, and opening the clipboard are completely prohibited.
+              </li>
+            </ul>
+          </div>
+
+          {gateError && (
+            <p className="error-message" role="alert" style={{ marginTop: "12px" }}>
+              {gateError}
+            </p>
+          )}
+
+          <button
+            type="button"
+            className="primary-button"
+            style={{ width: "100%", marginTop: "20px" }}
+            disabled={enablingMedia || (Boolean(localStream) && !micCheckPassed)}
+            onClick={() => void startSessionWithMediaAndFullscreen()}
+          >
+            {enablingMedia
+              ? "Activating devices…"
+              : !localStream
+              ? "1. Enable Camera & Mic"
+              : !micCheckPassed
+              ? `Speak into mic (Peak: ${peakVolume}% / >${MIC_VOLUME_THRESHOLD}%)`
+              : "2. Enter Fullscreen & Begin Session"}
+          </button>
+        </section>
+      </main>
+    );
+  }
+
   return (
     <main className="workspace-page">
       <header className="workspace-header">
@@ -920,12 +1434,15 @@ export default function RoomPage() {
           <span className={`status-pill ${status === "Connected" ? "connected" : ""}`}>
             {status}
           </span>
+          <span className="integrity-active-pill" title="Strict Fullscreen, Locked Media & Anti-Clipboard Enforced">
+            🔒 Strict Integrity Active
+          </span>
           <button
             type="button"
             className="secondary-button compact"
-            onClick={() => void copyInvite()}
+            onClick={() => void copySessionId()}
           >
-            Copy invite
+            {sessionIdCopied ? "Copied!" : "Copy Session ID"}
           </button>
           <button
             type="button"
@@ -997,26 +1514,63 @@ export default function RoomPage() {
           </div>
 
           <footer className="sidebar-controls">
-            <button
-              type="button"
-              className="secondary-button"
-              onClick={toggleAudio}
-              disabled={!localStream}
+            <div
+              className="media-enforced-indicator"
+              title="Camera and microphone are strictly enforced for interview integrity and cannot be disabled"
             >
-              {micEnabled ? "Mute mic" : "Unmute mic"}
-            </button>
-            <button
-              type="button"
-              className="secondary-button"
-              onClick={toggleCamera}
-              disabled={!localStream}
-            >
-              {cameraEnabled ? "Camera off" : "Camera on"}
-            </button>
+              <span className="media-status-dot" />
+              <span>Camera & Mic Active (Locked)</span>
+            </div>
           </footer>
         </aside>
       </div>
+
+      {showFullscreenOverlay && (
+        <div className="fullscreen-overlay-backdrop">
+          <div className="panel fullscreen-overlay-card">
+            <p className="eyebrow" style={{ color: "#f59e0b" }}>TESTING MODE: FULLSCREEN PAUSED</p>
+            <h2 style={{ margin: "10px 0 8px", fontSize: "22px" }}>Fullscreen Exited</h2>
+            <p className="muted" style={{ fontSize: "14px", lineHeight: "1.5" }}>
+              You have exited fullscreen mode. For testing purposes, your session has not been closed.
+              Please re-enter fullscreen to continue your interview.
+            </p>
+            <button
+              type="button"
+              className="primary-button"
+              style={{ width: "100%", marginTop: "18px" }}
+              onClick={() => void reenterFullscreen()}
+            >
+              Re-enter Fullscreen & Continue
+            </button>
+          </div>
+        </div>
+      )}
     </main>
+  );
+}
+
+function PreviewVideo({ stream }: { stream: MediaStream }) {
+  const videoRef = useRef<HTMLVideoElement>(null);
+
+  useEffect(() => {
+    if (videoRef.current && videoRef.current.srcObject !== stream) {
+      videoRef.current.srcObject = stream;
+    }
+  }, [stream]);
+
+  return (
+    <video
+      ref={videoRef}
+      autoPlay
+      playsInline
+      muted
+      style={{
+        width: "100%",
+        height: "100%",
+        objectFit: "cover",
+        transform: "scaleX(-1)",
+      }}
+    />
   );
 }
 
@@ -1032,7 +1586,9 @@ function VideoTile({
   const videoRef = useRef<HTMLVideoElement>(null);
 
   useEffect(() => {
-    if (videoRef.current) videoRef.current.srcObject = stream;
+    if (videoRef.current && videoRef.current.srcObject !== stream) {
+      videoRef.current.srcObject = stream;
+    }
   }, [stream]);
 
   return (

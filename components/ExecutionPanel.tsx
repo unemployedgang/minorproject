@@ -75,6 +75,22 @@ export default function ExecutionPanel({
           className="io-stdin-textarea"
           value={stdin}
           onChange={(event) => onStdinChange(event.target.value)}
+          onPaste={(e) => {
+            e.preventDefault();
+            e.stopPropagation();
+          }}
+          onCopy={(e) => {
+            e.preventDefault();
+            e.stopPropagation();
+          }}
+          onCut={(e) => {
+            e.preventDefault();
+            e.stopPropagation();
+          }}
+          onContextMenu={(e) => {
+            e.preventDefault();
+            e.stopPropagation();
+          }}
           placeholder="Enter stdin test input here (synced with peer)…"
           spellCheck={false}
         />
@@ -117,7 +133,21 @@ export default function ExecutionPanel({
           </div>
         </div>
 
-        <div className="io-terminal-body">
+        <div
+          className="io-terminal-body"
+          onCopy={(e) => {
+            e.preventDefault();
+            e.stopPropagation();
+          }}
+          onCut={(e) => {
+            e.preventDefault();
+            e.stopPropagation();
+          }}
+          onContextMenu={(e) => {
+            e.preventDefault();
+            e.stopPropagation();
+          }}
+        >
           {!result && !isRunning && (
             <p className="io-placeholder">
               Click <strong>Run Code</strong> (or press Ctrl+Enter / Cmd+Enter) to execute in the Judge0 sandbox.
